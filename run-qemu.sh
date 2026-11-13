@@ -14,6 +14,19 @@
 #   VM_DIR=~/.local/share/pulsar-vm   (persistent disk + UEFI variables)
 #   FRESH=1                           (recreate the disk and UEFI variables)
 #   NO_KVM=1                          (run without KVM acceleration)
+#   BT_USB=0bda:4852                  (pass this host USB Bluetooth adapter to the guest; vendor:product as
+#                                      printed by lsusb; unset = no Bluetooth in the guest, as before)
+#
+# BT_USB notes (for testing Bluetooth software such as pulsaros-airpods in the VM):
+#   - The host loses Bluetooth until the VM exits: the guest owns the adapter. QEMU detaches the host btusb
+#     driver itself and re-attaches it on a clean exit. After a QEMU crash, replug the adapter, or as root
+#     rebind btusb for its interfaces (e.g. echo 1-3:1.0 > /sys/bus/usb/drivers/btusb/bind, and 1-3:1.1).
+#   - QEMU needs read/write access to the adapter's /dev/bus/usb node, which is root-only by default. This
+#     script never installs a rule; it prints one when access is missing. For 0bda:4852 it is, in
+#     /etc/udev/rules.d/99-pulsar-vm-bt.rules:
+#       SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="4852", GROUP="kvm", MODE="0660"
+#     then: sudo udevadm control --reload && sudo udevadm trigger -s usb -c add   (and replug the adapter)
+#   - The Pulsar OS ISO already carries btusb, btrtl and the Realtek firmware, so nothing is added to the guest.
 # ==============================================================================
 set -euo pipefail
 
@@ -40,6 +53,39 @@ ISO="$(realpath "$ISO")"
 # --- Tools --------------------------------------------------------------------
 command -v qemu-system-x86_64 >/dev/null || { echo "❌ qemu-system-x86_64 not found. Install qemu-full (Arch) or qemu-system-x86 (Debian/Ubuntu)." >&2; exit 1; }
 command -v qemu-img >/dev/null || { echo "❌ qemu-img not found. Install qemu-full (Arch) or qemu-utils (Debian/Ubuntu)." >&2; exit 1; }
+
+# --- Bluetooth passthrough (opt-in) ----------------------------------------------
+BT_ARGS=()
+if [ -n "${BT_USB:-}" ]; then
+    if ! [[ "$BT_USB" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
+        echo "❌ BT_USB must look like 0bda:4852 (vendor:product, as printed by lsusb), got: $BT_USB" >&2
+        exit 1
+    fi
+    bt_vid="${BT_USB%%:*}"; bt_vid="${bt_vid,,}"
+    bt_pid="${BT_USB##*:}"; bt_pid="${bt_pid,,}"
+    bt_node=""
+    for d in /sys/bus/usb/devices/*; do
+        [ -r "$d/idVendor" ] && [ -r "$d/idProduct" ] || continue
+        if [ "$(<"$d/idVendor")" = "$bt_vid" ] && [ "$(<"$d/idProduct")" = "$bt_pid" ]; then
+            bt_node=$(printf '/dev/bus/usb/%03d/%03d' "$((10#$(<"$d/busnum")))" "$((10#$(<"$d/devnum")))")
+            break
+        fi
+    done
+    if [ -z "$bt_node" ]; then
+        echo "❌ BT_USB=$BT_USB: no USB device with that id is plugged in (check lsusb)." >&2
+        exit 1
+    fi
+    if [ ! -r "$bt_node" ] || [ ! -w "$bt_node" ]; then
+        echo "❌ BT_USB=$BT_USB: $bt_node is not readable and writable by $(id -un)." >&2
+        echo "   Add this udev rule as /etc/udev/rules.d/99-pulsar-vm-bt.rules, then reload and replug the adapter:" >&2
+        echo "   SUBSYSTEM==\"usb\", ENV{DEVTYPE}==\"usb_device\", ATTRS{idVendor}==\"$bt_vid\", ATTRS{idProduct}==\"$bt_pid\", GROUP=\"kvm\", MODE=\"0660\"" >&2
+        echo "   sudo udevadm control --reload && sudo udevadm trigger -s usb -c add" >&2
+        exit 1
+    fi
+    echo "⚠️  BT_USB=$BT_USB: the host loses Bluetooth until this VM exits." >&2
+    BT_ARGS=(-device qemu-xhci,id=xhci
+             -device "usb-host,bus=xhci.0,vendorid=0x$bt_vid,productid=0x$bt_pid,guest-reset=false")
+fi
 
 # --- UEFI firmware --------------------------------------------------------------
 # Preferred: split CODE + VARS pair, so UEFI variables persist between boots.
@@ -141,4 +187,5 @@ exec qemu-system-x86_64 \
     -vga virtio \
     -device virtio-tablet-pci \
     -nic user,model=virtio-net-pci \
+    "${BT_ARGS[@]}" \
     -display default,show-cursor=on
